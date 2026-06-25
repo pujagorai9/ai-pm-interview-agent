@@ -1,5 +1,5 @@
 "use client";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { SessionState, InterviewTurn, InterviewTurnResponse } from "@/lib/types";
 import { STAGE_QUESTION_PLANS } from "@/lib/prompts";
 import SetupForm from "@/components/SetupForm";
@@ -19,6 +19,38 @@ const INITIAL_SESSION: Partial<SessionState> = {
   suspectedLiveInterviewFlag: false,
   voicePermission: "unknown",
 };
+
+function AssessmentLoadingScreen() {
+  const [elapsed, setElapsed] = useState(0);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    intervalRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+  }, []);
+
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+  return (
+    <div className="container">
+      <div className="card" style={{ textAlign: "center", padding: 48 }}>
+        <div style={{ fontSize: 48, marginBottom: 16 }}>📊</div>
+        <h2>Generating Your Assessment</h2>
+        <p style={{ color: "var(--text-muted)", marginTop: 8 }}>
+          Analyzing your interview responses and generating evidence-based feedback…
+        </p>
+        <p style={{ color: "var(--text-muted)", fontSize: 13, marginTop: 8 }}>
+          This typically takes 30–90 seconds. Please do not refresh.
+        </p>
+        <p style={{ color: "var(--text-muted)", fontSize: 13, marginTop: 6, fontWeight: 500 }}>
+          ⏱ {timeStr} elapsed
+        </p>
+      </div>
+    </div>
+  );
+}
 
 export default function Home() {
   const [session, setSession] = useState<SessionState>(INITIAL_SESSION as SessionState);
@@ -45,35 +77,30 @@ export default function Home() {
       ...s,
       mode,
       voicePermission,
-      status: "MODE_SELECTED",
+      status: "INTERVIEW_IN_PROGRESS",
       startedAtIso: new Date().toISOString(),
     }));
-    // Immediately transition to interview in progress
-    setSession((s) => ({ ...s, status: "INTERVIEW_IN_PROGRESS" }));
   }
 
-  const handleTurnComplete = useCallback((turn: InterviewTurn, response: InterviewTurnResponse) => {
+  // Atomically commit one or more turns in a single state update
+  const handleTurnsComplete = useCallback((newTurns: InterviewTurn[], response: InterviewTurnResponse) => {
     setSession((s) => {
-      const newTurns = [...s.turns, turn];
-      let newIndex = s.currentMainQuestionIndex;
-      let newFollowUps = s.followUpsUsedForCurrentQuestion;
+      const turns = [...s.turns, ...newTurns];
+      let currentMainQuestionIndex = s.currentMainQuestionIndex;
+      let followUpsUsedForCurrentQuestion = s.followUpsUsedForCurrentQuestion;
 
-      if (turn.role === "candidate") {
-        // After candidate answers, check if we should increment
+      // The last candidate turn in the batch determines index changes
+      const lastCandidateTurn = [...newTurns].reverse().find((t) => t.role === "candidate");
+      if (lastCandidateTurn) {
         if (response.shouldIncrementMainQuestion) {
-          newIndex = s.currentMainQuestionIndex + 1;
-          newFollowUps = 0;
+          currentMainQuestionIndex = s.currentMainQuestionIndex + 1;
+          followUpsUsedForCurrentQuestion = 0;
         } else if (response.type === "follow_up") {
-          newFollowUps = s.followUpsUsedForCurrentQuestion + 1;
+          followUpsUsedForCurrentQuestion = s.followUpsUsedForCurrentQuestion + 1;
         }
       }
 
-      return {
-        ...s,
-        turns: newTurns,
-        currentMainQuestionIndex: newIndex,
-        followUpsUsedForCurrentQuestion: newFollowUps,
-      };
+      return { ...s, turns, currentMainQuestionIndex, followUpsUsedForCurrentQuestion };
     });
   }, []);
 
@@ -86,47 +113,54 @@ export default function Home() {
   }
 
   async function handleCandidateQuestionsSubmit(questions: string) {
-    setSession((s) => ({ ...s, candidateQuestions: questions, status: "GENERATING_ASSESSMENT" }));
-    setGeneratingAssessment(true);
-    setError("");
-
-    try {
-      const maxMainQuestions = session.stage === "recruiter_screen" ? 4 : 5;
-      const completedMainQuestions = Math.min(session.currentMainQuestionIndex, maxMainQuestions);
+    // Snapshot session values before going async — avoids stale closure issues
+    setSession((s) => {
+      const maxMainQuestions = s.stage === "recruiter_screen" ? 4 : 5;
+      const completedMainQuestions = Math.min(s.currentMainQuestionIndex, maxMainQuestions);
       const endedEarly = completedMainQuestions < maxMainQuestions;
 
-      const res = await fetch("/api/generate-assessment", {
+      // Kick off the fetch using current session snapshot
+      setGeneratingAssessment(true);
+      setError("");
+
+      fetch("/api/generate-assessment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          stage: session.stage,
-          targetLevel: session.targetLevel,
-          mode: session.mode,
-          resumeText: session.resumeText,
-          jdText: session.jdText,
-          turns: session.turns,
+          stage: s.stage,
+          targetLevel: s.targetLevel,
+          mode: s.mode,
+          resumeText: s.resumeText,
+          jdText: s.jdText,
+          turns: s.turns,
           candidateQuestions: questions || undefined,
           completedMainQuestions,
           endedEarly,
-          hintCount: session.hintCount,
-          voicePermission: session.voicePermission,
+          hintCount: s.hintCount,
+          voicePermission: s.voicePermission,
         }),
-      });
+      })
+        .then(async (res) => {
+          if (!res.ok) {
+            const errBody = await res.json().catch(() => ({}));
+            throw new Error(errBody.error || "Assessment generation failed");
+          }
+          return res.json();
+        })
+        .then((assessment) => {
+          setSession((prev) => ({ ...prev, assessment, status: "REPORT_READY" }));
+        })
+        .catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : "Unknown error";
+          setError(`Failed to generate assessment: ${msg}. Your transcript is preserved — you can try again.`);
+          setSession((prev) => ({ ...prev, status: "CANDIDATE_QUESTIONS" }));
+        })
+        .finally(() => {
+          setGeneratingAssessment(false);
+        });
 
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => ({}));
-        throw new Error(errBody.error || "Assessment generation failed");
-      }
-
-      const assessment = await res.json();
-      setSession((s) => ({ ...s, assessment, status: "REPORT_READY" }));
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      setError(`Failed to generate assessment: ${msg}. Your transcript is preserved.`);
-      setSession((s) => ({ ...s, status: "CANDIDATE_QUESTIONS" }));
-    } finally {
-      setGeneratingAssessment(false);
-    }
+      return { ...s, candidateQuestions: questions, status: "GENERATING_ASSESSMENT" as const };
+    });
   }
 
   // Render state machine
@@ -142,7 +176,7 @@ export default function Home() {
     return (
       <InterviewRoom
         session={session}
-        onTurnComplete={handleTurnComplete}
+        onTurnsComplete={handleTurnsComplete}
         onEndInterview={handleEndInterview}
         onMoveToCandidate={handleMoveToCandidate}
         onRestart={restart}
@@ -157,31 +191,25 @@ export default function Home() {
         {error && (
           <div className="container">
             <div className="error-banner error"><span>⚠️</span>{error}</div>
+            <div style={{ marginTop: 10 }}>
+              <button className="btn btn-primary" onClick={() => handleCandidateQuestionsSubmit(session.candidateQuestions || "")}>
+                Retry Assessment
+              </button>
+            </div>
           </div>
         )}
-        <CandidateQuestionsScreen
-          onSubmit={handleCandidateQuestionsSubmit}
-          onSkip={() => handleCandidateQuestionsSubmit("")}
-        />
+        {!error && (
+          <CandidateQuestionsScreen
+            onSubmit={handleCandidateQuestionsSubmit}
+            onSkip={() => handleCandidateQuestionsSubmit("")}
+          />
+        )}
       </div>
     );
   }
 
   if (session.status === "GENERATING_ASSESSMENT" || generatingAssessment) {
-    return (
-      <div className="container">
-        <div className="card" style={{ textAlign: "center", padding: 48 }}>
-          <div style={{ fontSize: 48, marginBottom: 16 }}>📊</div>
-          <h2>Generating Your Assessment</h2>
-          <p style={{ color: "var(--text-muted)", marginTop: 8 }}>
-            Analyzing your interview responses and generating evidence-based feedback…
-          </p>
-          <p style={{ color: "var(--text-muted)", fontSize: 13, marginTop: 8 }}>
-            This may take 20–40 seconds.
-          </p>
-        </div>
-      </div>
-    );
+    return <AssessmentLoadingScreen />;
   }
 
   if (session.status === "REPORT_READY" && session.assessment) {

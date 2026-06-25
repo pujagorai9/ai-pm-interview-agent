@@ -3,6 +3,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { buildAssessmentPrompt } from "@/lib/prompts";
 import { AssessmentReport, InterviewStage, InterviewTurn } from "@/lib/types";
 
+export const maxDuration = 300; // 5 minutes — needed on Vercel Pro
+
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 async function callModel(prompt: string): Promise<string> {

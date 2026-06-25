@@ -1,19 +1,19 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { SessionState, InterviewTurn, InterviewTurnResponse } from "@/lib/types";
-import { STAGE_LABELS, STAGE_QUESTION_PLANS } from "@/lib/prompts";
+import { STAGE_LABELS } from "@/lib/prompts";
 import VoiceInputButton from "./VoiceInputButton";
 
 interface Props {
   session: SessionState;
-  onTurnComplete: (turn: InterviewTurn, response: InterviewTurnResponse) => void;
+  onTurnsComplete: (turns: InterviewTurn[], response: InterviewTurnResponse) => void;
   onEndInterview: () => void;
   onMoveToCandidate: () => void;
   onRestart: () => void;
   onError: (msg: string) => void;
 }
 
-export default function InterviewRoom({ session, onTurnComplete, onEndInterview, onMoveToCandidate, onRestart, onError }: Props) {
+export default function InterviewRoom({ session, onTurnsComplete, onEndInterview, onMoveToCandidate, onRestart, onError }: Props) {
   const [answer, setAnswer] = useState("");
   const [loading, setLoading] = useState(false);
   const [confirmRestart, setConfirmRestart] = useState(false);
@@ -37,14 +37,10 @@ export default function InterviewRoom({ session, onTurnComplete, onEndInterview,
   async function fetchNextTurn(candidateAnswer?: string) {
     setLoading(true);
     try {
-      const turns = candidateAnswer
+      const turnsForApi = candidateAnswer
         ? [
             ...session.turns,
-            {
-              role: "candidate" as const,
-              content: candidateAnswer,
-              timestamp: new Date().toISOString(),
-            },
+            { role: "candidate" as const, content: candidateAnswer, timestamp: new Date().toISOString() },
           ]
         : session.turns;
 
@@ -57,7 +53,7 @@ export default function InterviewRoom({ session, onTurnComplete, onEndInterview,
           resumeText: session.resumeText,
           jdText: session.jdText,
           importedPriorAssessment: session.importedPriorAssessment,
-          turns,
+          turns: turnsForApi,
           currentMainQuestionIndex: session.currentMainQuestionIndex,
           followUpsUsedForCurrentQuestion: session.followUpsUsedForCurrentQuestion,
         }),
@@ -70,35 +66,31 @@ export default function InterviewRoom({ session, onTurnComplete, onEndInterview,
 
       const response: InterviewTurnResponse = await res.json();
 
+      // Build the batch of new turns to commit atomically
+      const newTurns: InterviewTurn[] = [];
+
+      if (candidateAnswer) {
+        newTurns.push({ role: "candidate", content: candidateAnswer, timestamp: new Date().toISOString() });
+      }
+
       if (response.type === "move_to_candidate_questions") {
-        if (candidateAnswer) {
-          onTurnComplete(
-            { role: "candidate", content: candidateAnswer, timestamp: new Date().toISOString() },
-            response
-          );
-        }
+        // Commit candidate turn (if any) then transition
+        if (newTurns.length > 0) onTurnsComplete(newTurns, response);
         onMoveToCandidate();
         return;
       }
 
-      const interviewerTurn: InterviewTurn = {
-        role: "interviewer",
-        content: response.questionText || "",
-        questionCategory: response.questionCategory,
-        timestamp: new Date().toISOString(),
-      };
-
-      if (candidateAnswer) {
-        const candidateTurn: InterviewTurn = {
-          role: "candidate",
-          content: candidateAnswer,
+      if (response.questionText) {
+        newTurns.push({
+          role: "interviewer",
+          content: response.questionText,
+          questionCategory: response.questionCategory,
           timestamp: new Date().toISOString(),
-        };
-        onTurnComplete(candidateTurn, response);
-        setTimeout(() => onTurnComplete(interviewerTurn, { ...response, shouldIncrementMainQuestion: false }), 50);
-      } else {
-        onTurnComplete(interviewerTurn, response);
+        });
       }
+
+      // Single atomic state update for both turns
+      onTurnsComplete(newTurns, response);
     } catch {
       onError("Network error. Please check your connection and try again.");
     } finally {
