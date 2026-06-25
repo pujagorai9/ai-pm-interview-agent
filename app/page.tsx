@@ -1,6 +1,6 @@
 "use client";
 import { useState, useCallback, useEffect, useRef } from "react";
-import { SessionState, InterviewTurn, InterviewTurnResponse } from "@/lib/types";
+import { SessionState, InterviewTurn, InterviewTurnResponse, AssessmentReport } from "@/lib/types";
 import { STAGE_QUESTION_PLANS } from "@/lib/prompts";
 import SetupForm from "@/components/SetupForm";
 import ModeSelector from "@/components/ModeSelector";
@@ -20,33 +20,95 @@ const INITIAL_SESSION: Partial<SessionState> = {
   voicePermission: "unknown",
 };
 
-function AssessmentLoadingScreen() {
+// Reads an SSE stream from the assessment API.
+// Calls onToken for each streamed token (for live preview),
+// resolves with the parsed AssessmentReport on "done", rejects on "error".
+async function readAssessmentStream(
+  res: Response,
+  onToken: (token: string) => void
+): Promise<AssessmentReport> {
+  if (!res.body) throw new Error("No response body");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let lastEvent = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE format: lines grouped by \n\n blocks
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() ?? "";
+
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      let event = lastEvent;
+      let data = "";
+      for (const line of lines) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data = line.slice(6);
+      }
+      lastEvent = event;
+      if (!data) continue;
+
+      if (event === "token") {
+        try { onToken(JSON.parse(data)); } catch { /* ignore */ }
+      } else if (event === "done") {
+        try { return JSON.parse(data) as AssessmentReport; } catch {
+          throw new Error("Assessment JSON was invalid.");
+        }
+      } else if (event === "error") {
+        let msg = data;
+        try { msg = JSON.parse(data); } catch { /* use raw */ }
+        throw new Error(msg);
+      }
+    }
+  }
+  throw new Error("Stream ended without a result.");
+}
+
+function AssessmentLoadingScreen({ streamedText }: { streamedText: string }) {
   const [elapsed, setElapsed] = useState(0);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const previewRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
-    intervalRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+    const id = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => clearInterval(id);
   }, []);
 
-  const mins = Math.floor(elapsed / 60);
-  const secs = elapsed % 60;
-  const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  useEffect(() => {
+    if (previewRef.current) previewRef.current.scrollTop = previewRef.current.scrollHeight;
+  }, [streamedText]);
+
+  const timeStr = elapsed >= 60 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : `${elapsed}s`;
 
   return (
     <div className="container">
-      <div className="card" style={{ textAlign: "center", padding: 48 }}>
-        <div style={{ fontSize: 48, marginBottom: 16 }}>📊</div>
-        <h2>Generating Your Assessment</h2>
-        <p style={{ color: "var(--text-muted)", marginTop: 8 }}>
-          Analyzing your interview responses and generating evidence-based feedback…
-        </p>
-        <p style={{ color: "var(--text-muted)", fontSize: 13, marginTop: 8 }}>
-          This typically takes 30–90 seconds. Please do not refresh.
-        </p>
-        <p style={{ color: "var(--text-muted)", fontSize: 13, marginTop: 6, fontWeight: 500 }}>
-          ⏱ {timeStr} elapsed
-        </p>
+      <div className="card" style={{ padding: 32 }}>
+        <div style={{ textAlign: "center", marginBottom: 24 }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }}>📊</div>
+          <h2>Generating Your Assessment</h2>
+          <p style={{ color: "var(--text-muted)", marginTop: 6, fontSize: 14 }}>
+            Please do not refresh — your report is being written in real time below.
+          </p>
+          <p style={{ color: "var(--text-muted)", fontSize: 13, marginTop: 4, fontWeight: 500 }}>
+            ⏱ {timeStr} elapsed
+          </p>
+        </div>
+        {streamedText && (
+          <pre
+            ref={previewRef}
+            style={{
+              background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6,
+              padding: 12, fontSize: 11, lineHeight: 1.5, maxHeight: 300, overflowY: "auto",
+              whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-muted)",
+            }}
+          >
+            {streamedText}
+          </pre>
+        )}
       </div>
     </div>
   );
@@ -56,17 +118,18 @@ export default function Home() {
   const [session, setSession] = useState<SessionState>(INITIAL_SESSION as SessionState);
   const [error, setError] = useState("");
   const [generatingAssessment, setGeneratingAssessment] = useState(false);
+  const [streamedText, setStreamedText] = useState("");
 
   function restart() {
     setSession(INITIAL_SESSION as SessionState);
     setError("");
     setGeneratingAssessment(false);
+    setStreamedText("");
   }
 
   function handleSetupContinue(data: Pick<SessionState, "resumeText" | "jdText" | "stage" | "targetLevel" | "importedPriorAssessment">) {
     setSession((s) => ({
-      ...s,
-      ...data,
+      ...s, ...data,
       plannedQuestionCategories: STAGE_QUESTION_PLANS[data.stage],
       status: "CONTEXT_READY",
     }));
@@ -74,22 +137,17 @@ export default function Home() {
 
   function handleModeSelect(mode: "chat" | "voice", voicePermission: SessionState["voicePermission"]) {
     setSession((s) => ({
-      ...s,
-      mode,
-      voicePermission,
+      ...s, mode, voicePermission,
       status: "INTERVIEW_IN_PROGRESS",
       startedAtIso: new Date().toISOString(),
     }));
   }
 
-  // Atomically commit one or more turns in a single state update
   const handleTurnsComplete = useCallback((newTurns: InterviewTurn[], response: InterviewTurnResponse) => {
     setSession((s) => {
       const turns = [...s.turns, ...newTurns];
       let currentMainQuestionIndex = s.currentMainQuestionIndex;
       let followUpsUsedForCurrentQuestion = s.followUpsUsedForCurrentQuestion;
-
-      // The last candidate turn in the batch determines index changes
       const lastCandidateTurn = [...newTurns].reverse().find((t) => t.role === "candidate");
       if (lastCandidateTurn) {
         if (response.shouldIncrementMainQuestion) {
@@ -99,7 +157,6 @@ export default function Home() {
           followUpsUsedForCurrentQuestion = s.followUpsUsedForCurrentQuestion + 1;
         }
       }
-
       return { ...s, turns, currentMainQuestionIndex, followUpsUsedForCurrentQuestion };
     });
   }, []);
@@ -113,57 +170,48 @@ export default function Home() {
   }
 
   async function handleCandidateQuestionsSubmit(questions: string) {
-    // Snapshot session values before going async — avoids stale closure issues
-    setSession((s) => {
-      const maxMainQuestions = s.stage === "recruiter_screen" ? 4 : 5;
-      const completedMainQuestions = Math.min(s.currentMainQuestionIndex, maxMainQuestions);
-      const endedEarly = completedMainQuestions < maxMainQuestions;
+    // Capture current session synchronously before going async
+    const snap = session;
+    const maxMainQuestions = snap.stage === "recruiter_screen" ? 4 : 5;
+    const completedMainQuestions = Math.min(snap.currentMainQuestionIndex, maxMainQuestions);
+    const endedEarly = completedMainQuestions < maxMainQuestions;
 
-      // Kick off the fetch using current session snapshot
-      setGeneratingAssessment(true);
-      setError("");
+    setSession((s) => ({ ...s, candidateQuestions: questions, status: "GENERATING_ASSESSMENT" }));
+    setGeneratingAssessment(true);
+    setStreamedText("");
+    setError("");
 
-      fetch("/api/generate-assessment", {
+    try {
+      const res = await fetch("/api/generate-assessment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          stage: s.stage,
-          targetLevel: s.targetLevel,
-          mode: s.mode,
-          resumeText: s.resumeText,
-          jdText: s.jdText,
-          turns: s.turns,
+          stage: snap.stage, targetLevel: snap.targetLevel, mode: snap.mode,
+          resumeText: snap.resumeText, jdText: snap.jdText, turns: snap.turns,
           candidateQuestions: questions || undefined,
-          completedMainQuestions,
-          endedEarly,
-          hintCount: s.hintCount,
-          voicePermission: s.voicePermission,
+          completedMainQuestions, endedEarly,
+          hintCount: snap.hintCount, voicePermission: snap.voicePermission,
         }),
-      })
-        .then(async (res) => {
-          if (!res.ok) {
-            const errBody = await res.json().catch(() => ({}));
-            throw new Error(errBody.error || "Assessment generation failed");
-          }
-          return res.json();
-        })
-        .then((assessment) => {
-          setSession((prev) => ({ ...prev, assessment, status: "REPORT_READY" }));
-        })
-        .catch((e: unknown) => {
-          const msg = e instanceof Error ? e.message : "Unknown error";
-          setError(`Failed to generate assessment: ${msg}. Your transcript is preserved — you can try again.`);
-          setSession((prev) => ({ ...prev, status: "CANDIDATE_QUESTIONS" }));
-        })
-        .finally(() => {
-          setGeneratingAssessment(false);
-        });
+      });
 
-      return { ...s, candidateQuestions: questions, status: "GENERATING_ASSESSMENT" as const };
-    });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+
+      const assessment = await readAssessmentStream(res, (token) => {
+        setStreamedText((t) => t + token);
+      });
+
+      setSession((s) => ({ ...s, assessment, status: "REPORT_READY" }));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      setError(`Failed to generate assessment: ${msg}. Your transcript is preserved — you can try again.`);
+      setSession((s) => ({ ...s, status: "CANDIDATE_QUESTIONS" }));
+    } finally {
+      setGeneratingAssessment(false);
+    }
   }
 
-  // Render state machine
+  // ── State machine render ──────────────────────────────────────────────────
+
   if (session.status === "ONBOARDING") {
     return <SetupForm onContinue={handleSetupContinue} />;
   }
@@ -209,14 +257,13 @@ export default function Home() {
   }
 
   if (session.status === "GENERATING_ASSESSMENT" || generatingAssessment) {
-    return <AssessmentLoadingScreen />;
+    return <AssessmentLoadingScreen streamedText={streamedText} />;
   }
 
   if (session.status === "REPORT_READY" && session.assessment) {
     return (
       <div className="container">
         {error && <div className="error-banner error" style={{ marginBottom: 16 }}><span>⚠️</span>{error}</div>}
-
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
           <h1>Your Interview Assessment</h1>
           <div className="row-wrap" style={{ gap: 10 }}>
@@ -224,9 +271,7 @@ export default function Home() {
             <button className="btn btn-outline" onClick={restart}>↺ New Interview</button>
           </div>
         </div>
-
         <AssessmentReportView report={session.assessment} />
-
         <div style={{ marginTop: 24, textAlign: "center" }}>
           <button className="btn btn-primary" onClick={restart}>Start Another Interview</button>
         </div>
